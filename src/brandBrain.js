@@ -1,6 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+import { claudeText, extractJson } from './llm.js';
 
 const EMPTY_PROFILE = {
   tone_attributes: [],
@@ -11,6 +9,9 @@ const EMPTY_PROFILE = {
   personas: [],
   banned_words: []
 };
+
+// Settings the user edits by hand; regenerating the AI profile keeps them.
+const MANUAL_PREFERENCE_KEYS = ['hashtags_preference', 'content_length'];
 
 // Lightweight HTML -> text (no jsdom dependency)
 function stripHtml(html) {
@@ -31,14 +32,14 @@ export async function scrapeBrandSite(url) {
   try {
     if (!url) return null;
 
-    let fullUrl = url;
+    let fullUrl = url.trim();
     if (!/^https?:\/\//i.test(fullUrl)) fullUrl = 'https://' + fullUrl;
 
     const fetchText = async (u) => {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
       try {
-        const res = await fetch(u, { signal: controller.signal });
+        const res = await fetch(u, { signal: controller.signal, headers: { 'User-Agent': 'Mozilla/5.0 (BeHeard brand analyzer)' } });
         if (res.ok) return stripHtml(await res.text());
       } catch (err) {
         console.error('Failed to fetch', u, '-', err.message);
@@ -48,10 +49,12 @@ export async function scrapeBrandSite(url) {
       return '';
     };
 
-    let text = await fetchText(fullUrl);
-    text += '\n' + await fetchText(fullUrl.replace(/\/$/, '') + '/about');
+    const [home, about] = await Promise.all([
+      fetchText(fullUrl),
+      fetchText(fullUrl.replace(/\/$/, '') + '/about')
+    ]);
 
-    text = text.replace(/\s+/g, ' ').trim().substring(0, 8000);
+    const text = `${home}\n${about}`.replace(/\s+/g, ' ').trim().substring(0, 8000);
     return text || null;
   } catch (err) {
     console.error('Brand site scraping failed:', err.message);
@@ -66,21 +69,15 @@ export async function prefillBrandProfile(siteText) {
   try {
     if (!siteText) return {};
 
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      messages: [{
-        role: 'user',
-        content: `Based on this website content, suggest a brand voice description, target audience, and industry. Return ONLY valid JSON with keys: voiceDescription, targetAudience, industry.
+    const text = await claudeText({
+      maxTokens: 1024,
+      prompt: `Based on this website content, suggest a brand voice description, target audience, and industry. Return ONLY valid JSON with keys: voiceDescription, targetAudience, industry.
 
 Website content:
 ${siteText}`
-      }]
     });
 
-    const text = message.content[0]?.text || '';
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    return jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+    return extractJson(text) || {};
   } catch (err) {
     console.error('Prefill failed:', err.message);
     return {};
@@ -89,27 +86,26 @@ ${siteText}`
 
 /**
  * Generate a comprehensive brand profile from all collected data.
- * `brand` is a Mongo document/object; JSON fields are native (objects/arrays).
+ * `websiteText` is optional scraped site content.
  */
-export async function generateBrandProfile(brand) {
-  try {
-    const competitors = Array.isArray(brand.competitors)
-      ? JSON.stringify(brand.competitors)
-      : (brand.competitors || '[]');
-    const colors = brand.colors && typeof brand.colors === 'object'
-      ? JSON.stringify(brand.colors)
-      : (brand.colors || '{}');
+export async function generateBrandProfile(brand, websiteText = null) {
+  const competitors = Array.isArray(brand.competitors)
+    ? brand.competitors.join(', ')
+    : (brand.competitors || 'Not specified');
+  const colors = brand.colors && typeof brand.colors === 'object'
+    ? JSON.stringify(brand.colors)
+    : (brand.colors || '{}');
 
-    const profilePrompt = `You are a brand strategist. Analyze this brand data and create a comprehensive brand profile.
+  const profilePrompt = `You are a brand strategist. Analyze this brand data and create a comprehensive brand profile.
 
 Brand Name: ${brand.name}
 Industry: ${brand.industry || 'Not specified'}
 Voice Description: ${brand.voice_description || 'Not specified'}
 Target Audience: ${brand.target_audience || 'Not specified'}
-Competitors: ${competitors}
+Competitors: ${competitors || 'Not specified'}
 Sample Content: ${brand.sample_content || 'Not specified'}
 Colors: ${colors}
-Website Content: ${brand.website_content || 'Not provided'}
+Website Content: ${websiteText || 'Not provided'}
 
 Generate ONLY valid JSON (no markdown, no explanation) with this exact structure:
 {
@@ -130,35 +126,30 @@ Generate ONLY valid JSON (no markdown, no explanation) with this exact structure
   "banned_words": ["string"]
 }`;
 
-    let attempt = 0;
-    let profile = null;
-
-    while (attempt < 2 && !profile) {
-      try {
-        const message = await anthropic.messages.create({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 2048,
-          messages: [{ role: 'user', content: profilePrompt }]
-        });
-
-        const text = message.content[0]?.text || '';
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          profile = JSON.parse(jsonMatch[0]);
-        } else {
-          attempt++;
-        }
-      } catch (parseErr) {
-        console.error(`Profile generation attempt ${attempt + 1} failed:`, parseErr.message);
-        attempt++;
-      }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const profile = extractJson(await claudeText({ prompt: profilePrompt, maxTokens: 2048 }));
+      if (profile) return profile;
+    } catch (err) {
+      console.error(`Profile generation attempt ${attempt} failed:`, err.message);
     }
-
-    return profile || EMPTY_PROFILE;
-  } catch (err) {
-    console.error('Brand profile generation failed:', err.message);
-    return EMPTY_PROFILE;
   }
+  return EMPTY_PROFILE;
+}
+
+/**
+ * Combine a freshly generated AI profile with the preferences the user set by
+ * hand, so regenerating never wipes manual edits.
+ */
+export function mergeProfile(existing, generated) {
+  const prev = existing && typeof existing === 'object' ? existing : {};
+  const merged = { ...generated };
+  for (const key of MANUAL_PREFERENCE_KEYS) {
+    if (prev[key] !== undefined) merged[key] = prev[key];
+  }
+  const banned = new Set([...(prev.banned_words || []), ...(generated.banned_words || [])]);
+  merged.banned_words = [...banned];
+  return merged;
 }
 
 /**

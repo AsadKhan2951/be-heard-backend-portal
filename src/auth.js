@@ -1,9 +1,12 @@
 import jwt from 'jsonwebtoken';
 import bcryptjs from 'bcryptjs';
 import { randomUUID } from 'crypto';
-import { User, Brand, Content, Campaign, PRPiece, GeneratedImage } from './models/index.js';
+import { User, Brand, Content, Campaign, PRPiece, GeneratedImage, Analytics } from './models/index.js';
+import { JWT_SECRET } from './config.js';
+import { exactInsensitive } from './utils.js';
+import { loginKey, resetRateLimit } from './ratelimit.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'beheard-secret-key';
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function generateToken(userId) {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
@@ -33,27 +36,53 @@ export function authMiddleware(req, res, next) {
   next();
 }
 
+// Older accounts may have been stored with mixed-case emails.
+function findUserByEmail(email) {
+  return User.findOne({ email: exactInsensitive(email) }).lean();
+}
+
+function authResponse(user, token) {
+  return {
+    token,
+    userId: user.id,
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    company_name: user.company_name,
+    plan: user.plan,
+    onboarding_complete: user.onboarding_complete
+  };
+}
+
 export async function signup(req, res) {
   try {
-    const { email, name, password } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const password = String(req.body.password || '');
+    const name = String(req.body.name || '').trim();
 
-    const existing = await User.findOne({ email }).lean();
+    if (!EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: 'Please enter a valid email address' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const existing = await findUserByEmail(email);
     if (existing) {
       return res.status(400).json({ error: 'Email already exists' });
     }
 
-    const userId = randomUUID();
-    const passwordHash = await bcryptjs.hash(password, 10);
-
-    await User.create({
-      id: userId,
+    const user = {
+      id: randomUUID(),
       email,
-      name,
-      password_hash: passwordHash
-    });
+      name: name || email.split('@')[0],
+      password_hash: await bcryptjs.hash(password, 10),
+      plan: 'starter',
+      onboarding_complete: 0
+    };
+    await User.create(user);
 
-    const token = generateToken(userId);
-    res.json({ token, userId, email, name });
+    res.json(authResponse(user, generateToken(user.id)));
   } catch (err) {
     console.error('Signup error:', err);
     res.status(500).json({ error: 'Signup failed' });
@@ -62,9 +91,13 @@ export async function signup(req, res) {
 
 export async function login(req, res) {
   try {
-    const { email, password } = req.body;
+    const email = String(req.body.email || '').trim();
+    const password = String(req.body.password || '');
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
 
-    const user = await User.findOne({ email }).lean();
+    const user = await findUserByEmail(email);
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
@@ -74,8 +107,8 @@ export async function login(req, res) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = generateToken(user.id);
-    res.json({ token, userId: user.id, email, name: user.name });
+    resetRateLimit(loginKey(email));
+    res.json(authResponse(user, generateToken(user.id)));
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Login failed' });
@@ -85,7 +118,7 @@ export async function login(req, res) {
 export async function getMe(req, res) {
   try {
     const user = await User.findOne({ id: req.userId })
-      .select('id email name company_name plan onboarding_complete -_id')
+      .select('id email name company_name plan onboarding_complete created_at -_id')
       .lean();
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -97,16 +130,34 @@ export async function getMe(req, res) {
   }
 }
 
+export async function updateMe(req, res) {
+  try {
+    const set = {};
+    if (typeof req.body.name === 'string' && req.body.name.trim()) set.name = req.body.name.trim();
+    if (typeof req.body.company_name === 'string') set.company_name = req.body.company_name.trim();
+
+    if (Object.keys(set).length > 0) {
+      await User.updateOne({ id: req.userId }, { $set: set });
+    }
+    return getMe(req, res);
+  } catch (err) {
+    console.error('Update user error:', err);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+}
+
 export async function deleteAccount(req, res) {
   try {
     const userId = req.userId;
+    const brandIds = (await Brand.find({ user_id: userId }).select('id -_id').lean()).map(b => b.id);
     await Promise.all([
       User.deleteOne({ id: userId }),
       Brand.deleteMany({ user_id: userId }),
       Content.deleteMany({ user_id: userId }),
       Campaign.deleteMany({ user_id: userId }),
       PRPiece.deleteMany({ user_id: userId }),
-      GeneratedImage.deleteMany({ user_id: userId })
+      GeneratedImage.deleteMany({ user_id: userId }),
+      Analytics.deleteMany({ brand_id: { $in: brandIds } })
     ]);
     res.json({ success: true });
   } catch (err) {

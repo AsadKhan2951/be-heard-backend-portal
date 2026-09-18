@@ -1,9 +1,8 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { randomUUID } from 'crypto';
-import { GeneratedImage, Brand } from './models/index.js';
+import { GeneratedImage, Brand, Content } from './models/index.js';
 import { generateImageDataUri } from './imagegen.js';
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+import { claudeText } from './llm.js';
+import { mediaUrl, mediaUrlExpr } from './media.js';
 
 const FORMATS = {
   'ig-post': { name: 'Instagram Post', ratio: '1:1' },
@@ -28,38 +27,29 @@ export async function generateCreative(req, res) {
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
+    if (contentId && !(await Content.exists({ id: contentId, user_id: userId }))) {
+      return res.status(404).json({ error: 'Content not found' });
+    }
 
-    const brandData = {
-      name: brand.name,
-      colors: brand.colors || {}
-    };
-
-    // Generate image prompt via Claude
-    const promptRequest = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 512,
-      messages: [{
-        role: 'user',
-        content: `Create a detailed image prompt for a ${FORMATS[format].name} (${FORMATS[format].ratio}) in ${style} style for ${brandData.name}.
+    const imagePrompt = await claudeText({
+      maxTokens: 512,
+      prompt: `Create a detailed image prompt for a ${FORMATS[format].name} (${FORMATS[format].ratio}) in ${style} style for ${brand.name}${brand.industry ? `, a ${brand.industry} brand` : ''}.
 ${description ? `Context: ${description}` : ''}
-Brand colors: ${JSON.stringify(brandData.colors)}
+Brand colors: ${JSON.stringify(brand.colors || {})}
 
 Requirements:
 - Professional, high-quality
 - No text or watermarks
-- Optimized for ${format}
+- Optimized for ${FORMATS[format].name}
 - Style: ${style}
 - Aspect ratio: ${FORMATS[format].ratio}
 
 Respond with ONLY the detailed image prompt.`
-      }]
     });
 
-    const imagePrompt = promptRequest.content[0].text;
-
-    const imageUrl = await generateImageDataUri(imagePrompt);
-    if (!imageUrl) {
-      return res.status(500).json({ error: 'Failed to generate image' });
+    const imageUri = await generateImageDataUri(imagePrompt);
+    if (!imageUri) {
+      return res.status(502).json({ error: 'Failed to generate image. Please try again.' });
     }
 
     const creativeId = randomUUID();
@@ -69,13 +59,13 @@ Respond with ONLY the detailed image prompt.`
       brand_id: brandId,
       user_id: userId,
       prompt: imagePrompt,
-      image_url: imageUrl,
+      image_url: imageUri,
       format
     });
 
     res.json({
       id: creativeId,
-      imageUrl,
+      imageUrl: mediaUrl('creative', creativeId, imageUri),
       prompt: imagePrompt,
       format,
       style,
@@ -90,22 +80,22 @@ Respond with ONLY the detailed image prompt.`
 
 export async function getCreativeGallery(req, res) {
   try {
-    const userId = req.userId;
-    const { brandId } = req.query;
+    const filter = { user_id: req.userId };
+    if (req.query.brandId) filter.brand_id = req.query.brandId;
 
-    const filter = { user_id: userId };
-    if (brandId) filter.brand_id = brandId;
-
-    const images = await GeneratedImage.find(filter).sort({ created_at: -1 }).lean();
+    const images = await GeneratedImage.aggregate([
+      { $match: filter },
+      { $sort: { created_at: -1 } },
+      { $set: { image_url: mediaUrlExpr('creative') } },
+      { $project: { _id: 0, image_data: 0 } }
+    ]);
 
     // Attach brand_name
     const brandIds = [...new Set(images.map(i => i.brand_id).filter(Boolean))];
     const brands = await Brand.find({ id: { $in: brandIds } }).select('id name -_id').lean();
     const brandNameById = Object.fromEntries(brands.map(b => [b.id, b.name]));
 
-    const enriched = images.map(i => ({ ...i, brand_name: brandNameById[i.brand_id] || null }));
-
-    res.json(enriched);
+    res.json(images.map(i => ({ ...i, brand_name: brandNameById[i.brand_id] || null })));
   } catch (err) {
     console.error('Get creative gallery error:', err);
     res.status(500).json({ error: 'Failed to get gallery' });
@@ -115,21 +105,20 @@ export async function getCreativeGallery(req, res) {
 export async function regenerateCreative(req, res) {
   try {
     const { creativeId } = req.params;
-    const userId = req.userId;
 
-    const creative = await GeneratedImage.findOne({ id: creativeId, user_id: userId }).lean();
+    const creative = await GeneratedImage.findOne({ id: creativeId, user_id: req.userId }).select('id prompt -_id').lean();
     if (!creative) {
       return res.status(404).json({ error: 'Creative not found' });
     }
 
-    const imageUrl = await generateImageDataUri(creative.prompt);
-    if (!imageUrl) {
-      return res.status(500).json({ error: 'Failed to regenerate image' });
+    const imageUri = await generateImageDataUri(creative.prompt);
+    if (!imageUri) {
+      return res.status(502).json({ error: 'Failed to regenerate image. Please try again.' });
     }
 
-    await GeneratedImage.updateOne({ id: creativeId }, { $set: { image_url: imageUrl } });
+    await GeneratedImage.updateOne({ id: creativeId }, { $set: { image_url: imageUri } });
 
-    res.json({ id: creativeId, imageUrl });
+    res.json({ id: creativeId, imageUrl: mediaUrl('creative', creativeId, imageUri) });
   } catch (err) {
     console.error('Regenerate creative error:', err);
     res.status(500).json({ error: 'Failed to regenerate creative' });
@@ -138,15 +127,10 @@ export async function regenerateCreative(req, res) {
 
 export async function deleteCreative(req, res) {
   try {
-    const { creativeId } = req.params;
-    const userId = req.userId;
-
-    const creative = await GeneratedImage.findOne({ id: creativeId, user_id: userId }).select('id').lean();
-    if (!creative) {
+    const result = await GeneratedImage.deleteOne({ id: req.params.creativeId, user_id: req.userId });
+    if (result.deletedCount === 0) {
       return res.status(404).json({ error: 'Creative not found' });
     }
-
-    await GeneratedImage.deleteOne({ id: creativeId });
     res.json({ success: true });
   } catch (err) {
     console.error('Delete creative error:', err);

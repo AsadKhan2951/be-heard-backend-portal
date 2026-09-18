@@ -1,27 +1,57 @@
 import { randomUUID } from 'crypto';
 import { Brand } from './models/index.js';
-import { scrapeBrandSite, prefillBrandProfile, generateBrandProfile } from './brandBrain.js';
+import { scrapeBrandSite, prefillBrandProfile, generateBrandProfile, mergeProfile } from './brandBrain.js';
+import { mediaUrl, mediaUrlExpr } from './media.js';
+
+const DEFAULT_COLORS = { primary: '#BFFF00', secondary: '#0a0a0a' };
+
+// Never send the Meta page token to the browser.
+function toClient(brand) {
+  if (!brand) return brand;
+  const { meta_page_token, _id, ...rest } = brand;
+  return {
+    ...rest,
+    logo_url: mediaUrl('logo', brand.id, brand.logo_url),
+    meta_connected: !!(brand.meta_page_id && meta_page_token)
+  };
+}
+
+function normalizeCompetitors(value) {
+  if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+  if (typeof value === 'string') return value.split(/[,\n]/).map(v => v.trim()).filter(Boolean);
+  return [];
+}
+
+// Accept both camelCase and snake_case keys from clients.
+function pick(body, camel, snake) {
+  if (body[camel] !== undefined) return body[camel];
+  if (snake && body[snake] !== undefined) return body[snake];
+  return undefined;
+}
 
 export async function createBrand(req, res) {
   try {
-    const { name, industry, colors, voiceDescription, targetAudience, competitors, sampleContent } = req.body;
-    const userId = req.userId;
+    const name = String(req.body.name || '').trim();
+    if (!name) {
+      return res.status(400).json({ error: 'Brand name is required' });
+    }
 
     const brandId = randomUUID();
-
     await Brand.create({
       id: brandId,
-      user_id: userId,
+      user_id: req.userId,
       name,
-      industry,
-      colors: colors || { primary: '#BFFF00', secondary: '#0a0a0a' },
-      voice_description: voiceDescription,
-      target_audience: targetAudience,
-      competitors: competitors || [],
-      sample_content: sampleContent
+      industry: req.body.industry,
+      website_url: pick(req.body, 'websiteUrl', 'website_url'),
+      colors: req.body.colors || DEFAULT_COLORS,
+      voice_description: pick(req.body, 'voiceDescription', 'voice_description'),
+      target_audience: pick(req.body, 'targetAudience', 'target_audience'),
+      competitors: normalizeCompetitors(req.body.competitors),
+      sample_content: pick(req.body, 'sampleContent', 'sample_content'),
+      onboarding_step: 2
     });
 
-    res.json({ id: brandId, name, industry });
+    res.json({ id: brandId, name, industry: req.body.industry });
   } catch (err) {
     console.error('Create brand error:', err);
     res.status(500).json({ error: 'Failed to create brand' });
@@ -30,10 +60,17 @@ export async function createBrand(req, res) {
 
 export async function getBrands(req, res) {
   try {
-    const userId = req.userId;
-    const brands = await Brand.find({ user_id: userId, active: 1 })
-      .sort({ created_at: -1 })
-      .lean();
+    const brands = await Brand.aggregate([
+      { $match: { user_id: req.userId, active: 1 } },
+      { $sort: { created_at: -1 } },
+      {
+        $set: {
+          logo_url: mediaUrlExpr('logo', 'logo_url'),
+          meta_connected: { $and: [{ $gt: ['$meta_page_id', null] }, { $gt: ['$meta_page_token', null] }] }
+        }
+      },
+      { $project: { _id: 0, meta_page_token: 0 } }
+    ]);
 
     res.json(brands);
   } catch (err) {
@@ -44,15 +81,11 @@ export async function getBrands(req, res) {
 
 export async function getBrand(req, res) {
   try {
-    const { brandId } = req.params;
-    const userId = req.userId;
-
-    const brand = await Brand.findOne({ id: brandId, user_id: userId }).lean();
+    const brand = await Brand.findOne({ id: req.params.brandId, user_id: req.userId, active: 1 }).lean();
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
-
-    res.json(brand);
+    res.json(toClient(brand));
   } catch (err) {
     console.error('Get brand error:', err);
     res.status(500).json({ error: 'Failed to get brand' });
@@ -62,66 +95,107 @@ export async function getBrand(req, res) {
 export async function updateBrand(req, res) {
   try {
     const { brandId } = req.params;
-    const userId = req.userId;
-    const updates = req.body;
+    const body = req.body || {};
 
-    const brand = await Brand.findOne({ id: brandId, user_id: userId }).select('id').lean();
+    const brand = await Brand.findOne({ id: brandId, user_id: req.userId }).select('id -_id').lean();
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
 
     const set = {};
-    if (updates.name) set.name = updates.name;
-    if (updates.colors) set.colors = updates.colors;
-    if (updates.voiceDescription) set.voice_description = updates.voiceDescription;
-    if (updates.targetAudience) set.target_audience = updates.targetAudience;
-    if (updates.competitors) set.competitors = updates.competitors;
-    if (updates.logoUrl) set.logo_url = updates.logoUrl;
-    if (updates.metaPageId) set.meta_page_id = updates.metaPageId;
-    if (updates.metaPageToken) set.meta_page_token = updates.metaPageToken;
-    if (updates.metaIgAccountId) set.meta_ig_account_id = updates.metaIgAccountId;
-    if (updates.industry) set.industry = updates.industry;
-    if (updates.sampleContent) set.sample_content = updates.sampleContent;
-    if (updates.websiteUrl) set.website_url = updates.websiteUrl;
-    if ('onboarding_step' in updates) set.onboarding_step = updates.onboarding_step;
-    if ('onboarding_complete' in updates) set.onboarding_complete = updates.onboarding_complete;
-    if ('content_preferences' in updates) set.content_preferences = updates.content_preferences;
+    const unset = {};
+    const text = (camel, snake, field) => {
+      const v = pick(body, camel, snake);
+      if (typeof v === 'string') set[field] = v.trim();
+    };
 
-    if (Object.keys(set).length === 0) {
-      return res.json({ id: brandId });
+    const name = pick(body, 'name');
+    if (typeof name === 'string' && name.trim()) set.name = name.trim();
+    text('industry', null, 'industry');
+    text('voiceDescription', 'voice_description', 'voice_description');
+    text('targetAudience', 'target_audience', 'target_audience');
+    text('sampleContent', 'sample_content', 'sample_content');
+    text('websiteUrl', 'website_url', 'website_url');
+
+    if (body.colors && typeof body.colors === 'object') set.colors = body.colors;
+
+    const competitors = pick(body, 'competitors');
+    if (competitors !== undefined) set.competitors = normalizeCompetitors(competitors);
+
+    // Only accept freshly uploaded images or external URLs, never our own
+    // /api/media links echoed back.
+    const logoUrl = pick(body, 'logoUrl', 'logo_url');
+    if (typeof logoUrl === 'string' && !logoUrl.startsWith('/api/media/')) set.logo_url = logoUrl;
+
+    const step = pick(body, 'onboardingStep', 'onboarding_step');
+    if (Number.isInteger(step)) set.onboarding_step = step;
+    const complete = pick(body, 'onboardingComplete', 'onboarding_complete');
+    if (complete !== undefined) set.onboarding_complete = complete ? 1 : 0;
+
+    // Manual content preferences live inside content_preferences; set them
+    // with dotted paths so the AI-generated profile is preserved.
+    const bannedWords = pick(body, 'bannedWords', 'banned_words');
+    if (bannedWords !== undefined) set['content_preferences.banned_words'] = normalizeCompetitors(bannedWords);
+    const hashtags = pick(body, 'hashtagsPreference', 'hashtags_preference');
+    if (['always', 'sometimes', 'never'].includes(hashtags)) set['content_preferences.hashtags_preference'] = hashtags;
+    const length = pick(body, 'contentLength', 'content_length');
+    if (['short', 'medium', 'long'].includes(length)) set['content_preferences.content_length'] = length;
+
+    if (body.disconnectMeta) {
+      Object.assign(unset, { meta_page_id: '', meta_page_name: '', meta_page_token: '', meta_ig_account_id: '', meta_connected_at: '' });
     }
 
-    await Brand.updateOne({ id: brandId }, { $set: set });
+    const update = {};
+    if (Object.keys(set).length) update.$set = set;
+    if (Object.keys(unset).length) update.$unset = unset;
+    if (Object.keys(update).length) {
+      await Brand.updateOne({ id: brandId }, update);
+    }
 
-    res.json({ id: brandId });
+    const updated = await Brand.findOne({ id: brandId }).lean();
+    res.json(toClient(updated));
   } catch (err) {
     console.error('Update brand error:', err);
     res.status(500).json({ error: 'Failed to update brand' });
   }
 }
 
+// Soft delete: hides the brand everywhere but keeps its content in the database.
+export async function deleteBrand(req, res) {
+  try {
+    const result = await Brand.updateOne(
+      { id: req.params.brandId, user_id: req.userId },
+      { $set: { active: 0 } }
+    );
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ error: 'Brand not found' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete brand error:', err);
+    res.status(500).json({ error: 'Failed to delete brand' });
+  }
+}
+
 // Scrape the brand website and return prefill suggestions (voice, audience, industry)
 export async function prefillBrand(req, res) {
   try {
-    const { brandId } = req.params;
-    const userId = req.userId;
-
-    const brand = await Brand.findOne({ id: brandId, user_id: userId }).lean();
+    const brand = await Brand.findOne({ id: req.params.brandId, user_id: req.userId }).lean();
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
 
-    if (!brand.website_url) {
+    const url = req.body?.websiteUrl || brand.website_url;
+    if (!url) {
       return res.json({});
     }
 
-    const siteText = await scrapeBrandSite(brand.website_url);
+    const siteText = await scrapeBrandSite(url);
     if (!siteText) {
       return res.json({});
     }
 
-    const suggestions = await prefillBrandProfile(siteText);
-    res.json(suggestions);
+    res.json(await prefillBrandProfile(siteText));
   } catch (err) {
     console.error('Prefill error:', err);
     res.json({});
@@ -132,14 +206,14 @@ export async function prefillBrand(req, res) {
 export async function regenerateBrandProfile(req, res) {
   try {
     const { brandId } = req.params;
-    const userId = req.userId;
 
-    const brand = await Brand.findOne({ id: brandId, user_id: userId }).lean();
+    const brand = await Brand.findOne({ id: brandId, user_id: req.userId }).lean();
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
     }
 
-    const profile = await generateBrandProfile(brand);
+    const websiteText = brand.website_url ? await scrapeBrandSite(brand.website_url) : null;
+    const profile = mergeProfile(brand.content_preferences, await generateBrandProfile(brand, websiteText));
 
     await Brand.updateOne({ id: brandId }, { $set: { content_preferences: profile } });
 

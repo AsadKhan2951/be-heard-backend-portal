@@ -30,8 +30,10 @@ const brandSchema = new Schema({
   sample_content: String,
   content_preferences: { type: Object, default: {} },
   meta_page_id: String,
+  meta_page_name: String,
   meta_page_token: String,
   meta_ig_account_id: String,
+  meta_connected_at: Date,
   website_url: String,
   onboarding_step: { type: Number, default: 1 },
   onboarding_complete: { type: Number, default: 0 },
@@ -52,11 +54,17 @@ const contentSchema = new Schema({
   image_data: String,
   media_brief: String,
   hashtags: { type: Array, default: [] },
+  // draft | scheduled | publishing | published | failed
   status: { type: String, default: 'draft' },
   scheduled_for: Date,
   published_at: Date,
   meta_post_id: String,
+  // Post ids per platform, e.g. { instagram: '...', facebook: '...' }
+  meta_post_ids: { type: Object, default: {} },
+  publish_error: String,
   campaign_id: { type: String, index: true },
+  // Position of this item in its campaign's content_plan
+  plan_index: Number,
   performance: { type: Object, default: {} },
   ai_prompt: String,
   version: { type: Number, default: 1 },
@@ -82,6 +90,10 @@ const campaignSchema = new Schema({
   content_plan: { type: Array, default: [] },
   kpis: { type: Object, default: {} },
   performance_summary: { type: Object, default: {} },
+  // Background content generation: idle | running | done | failed
+  generation_status: { type: String, default: 'idle' },
+  generation_started_at: Date,
+  generation_errors: { type: Array, default: [] },
   created_at: { type: Date, default: Date.now }
 }, opts);
 
@@ -94,6 +106,7 @@ const prPieceSchema = new Schema({
   title: String,
   body: String,
   target_outlets: { type: Array, default: [] },
+  // draft | final
   status: { type: String, default: 'draft' },
   created_at: { type: Date, default: Date.now }
 }, opts);

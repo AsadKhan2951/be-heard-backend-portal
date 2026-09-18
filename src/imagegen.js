@@ -1,4 +1,5 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { compressDataUri } from './imageutil.js';
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -7,9 +8,17 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
  * Images are stored inline (in MongoDB) instead of on the local filesystem so
  * the backend stays stateless and works on ephemeral hosts like Railway.
  *
+ * PNG output is re-encoded as JPEG, which is several times smaller and is the
+ * only format Instagram accepts.
+ *
  * Returns a `data:<mime>;base64,<data>` string, or null if generation failed.
  */
 export async function generateImageDataUri(prompt) {
+  const uri = await generateRaw(prompt);
+  return uri ? compressDataUri(uri) : null;
+}
+
+async function generateRaw(prompt) {
   const tryModel = async (modelName, withModalities) => {
     const model = genAI.getGenerativeModel({ model: modelName });
     const request = { contents: [{ role: 'user', parts: [{ text: prompt }] }] };
